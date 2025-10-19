@@ -128,4 +128,129 @@ def merge_small_headers(pieces, door, threshold):
     uppers  = []
     for (x, y, w, h) in pieces:
         # header := faixa cujo pé está exatamente no topo da porta (ou muito perto)
-        if abs(y - top_edge) <=_
+        if abs(y - top_edge) <= 1 and x <= dx and x + w >= dx + dw:
+            headers.append((x, y, w, h))
+        # candidates above header (encostados) cobrindo o mesmo X
+        if y > top_edge and x <= dx and x + w >= dx + dw:
+            uppers.append((x, y, w, h))
+
+    # tenta fundir cada header com a peça de cima
+    for hdr in headers:
+        hx, hy, hw, hh = hdr
+        if hh <= threshold + 1:  # pequeno
+            # acha a peça imediatamente acima (y == hy + hh)
+            match = None
+            for u in uppers:
+                ux, uy, uw, uh = u
+                if abs(uy - (hy + hh)) <= 1 and ux == hx and uw == hw:
+                    match = u; break
+            if match:
+                # remove as duas e coloca a fundida
+                pieces.remove(hdr); pieces.remove(match)
+                ux, uy, uw, uh = match
+                pieces.append((hx, hy, hw, hh + uh))
+    return pieces
+
+# ========== AJUSTES ==========
+if auto_mod:
+    wall_w = snap_dimension(wall_w, sheet_w, gap)
+    # Mantém faixa superior útil quando houver (não derruba para baixo se sobra >= grid_step)
+    rows = max(1, math.floor((wall_h + gap) / (sheet_h + gap)))
+    snap_down = rows*sheet_h + (rows-1)*gap
+    remainder = wall_h - snap_down
+    wall_h = snap_down if remainder < grid_step else int(wall_h)
+
+# posição da porta
+if door_w > 0 and door_h > 0:
+    if door_x_mode == "Centralizada":
+        door_x = wall_w/2 - door_w/2
+    elif door_x_mode == "Custom (slider)":
+        door_x = max(0, min(door_x_custom, wall_w - door_w))
+    else:  # alinhar à junta/grade
+        raw = wall_w/2 - door_w/2
+        door_x = snap_to_grid(raw, grid_step)
+        door_x = max(0, min(door_x, wall_w - door_w))
+else:
+    door_x = 0
+
+door_rect = (door_x, 0, door_w, door_h)
+
+# ========== OTIMIZAÇÃO (resumo) ==========
+def calc_efficiency(W, H, d_w, d_h, sw, sh, g, mode):
+    total = W * H
+    base = build_grid(mode, W, H, sw, sh, g)
+    used = sum(w*h for (_, _, w, h) in base) - d_w*d_h
+    used = max(0, used)
+    eff = used/total if total > 0 else 0
+    return eff, 1-eff, used
+
+effs = {}
+for lt in ["Vertical", "Horizontal", "Híbrido"]:
+    e,w,u = calc_efficiency(wall_w, wall_h, door_w, door_h, sheet_w, sheet_h, gap, lt)
+    effs[lt] = {"Aproveitamento (%)": round(e*100, 2), "Desperdício (%)": round(w*100, 2), "Área utilizada (m²)": round(u/1e6, 2)}
+df_eff = pd.DataFrame(effs).T
+best_layout = df_eff["Aproveitamento (%)"].idxmax() if not df_eff.empty else "Vertical"
+mode_to_draw = best_layout if layout_type == "Otimizar automaticamente" else layout_type
+
+# ========== PEÇAS + RECORTE ==========
+base_pieces = build_grid(mode_to_draw, wall_w, wall_h, sheet_w, sheet_h, gap)
+
+# subtrai a porta
+cut_pieces = []
+for r in base_pieces:
+    cut_pieces.extend(rect_subtract(r, door_rect))
+
+# remove peças mínimas e aplica grade
+filtered = []
+for (x,y,w,h) in cut_pieces:
+    if w > 5 and h > 5:
+        w2 = snap_to_grid(w, grid_step)
+        h2 = snap_to_grid(h, grid_step)
+        if w2 >= grid_step and h2 >= grid_step:
+            filtered.append((x, y, w2, h2))
+
+# FUNDE retalho de cabeceira (≤ grade) com a peça de cima
+if merge_sill and door_w > 0 and door_h > 0:
+    filtered = merge_small_headers(filtered, door_rect, threshold=grid_step)
+
+# ========== DESENHO ==========
+fig, ax = plt.subplots(figsize=(10, wall_h / wall_w * 10))
+ax.set_xlim(0, wall_w); ax.set_ylim(0, wall_h); ax.set_aspect("equal"); ax.axis("off")
+ax.add_patch(Rectangle((0, 0), wall_w, wall_h, fill=False, lw=2, edgecolor="black"))
+
+rows_out = []
+for idx, (x,y,w,h) in enumerate(filtered, start=1):
+    ax.add_patch(Rectangle((x, y), w, h, facecolor="#f3d8b6", edgecolor="black"))
+    if show_numbers: ax.text(x+w/2, y+h/2, f"{idx}", ha="center", va="center", fontsize=10, weight="bold")
+    if show_sizes:   ax.text(x+w/2, y+h-16, f"{format_mm(w)}×{format_mm(h)}", ha="center", va="top", fontsize=8)
+    rows_out.append({"#": idx, "Largura (mm)": int(round(w)), "Altura (mm)": int(round(h))})
+
+# porta por cima (visível)
+if door_w > 0 and door_h > 0:
+    ax.add_patch(Rectangle((door_x, 0), door_w, door_h, facecolor="white", edgecolor="black", lw=1.8))
+    ax.text(door_x + door_w/2, door_h/2, f"Porta\n{int(door_w)}×{int(door_h)}", ha="center", va="center", fontsize=11, weight="bold")
+
+st.pyplot(fig)
+
+# ========== TABELAS / EXPORT ==========
+st.markdown("---")
+st.subheader("📋 Lista de peças (após recorte/merge)")
+df_pieces = pd.DataFrame(rows_out)
+if df_pieces.empty:
+    st.info("Nenhuma peça após o recorte — ajuste as dimensões ou a grade.")
+else:
+    st.dataframe(df_pieces)
+    csv = df_pieces.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Baixar lista de peças (CSV)", data=csv, file_name="atlas_wall_cortes.csv", mime="text/csv")
+
+st.subheader("📊 Comparativo de Eficiência (pré-recorte)")
+st.dataframe(df_eff.style.highlight_max(subset=["Aproveitamento (%)"], color="#c4f0c2"))
+
+mod_fit = (wall_w + gap) % (sheet_w + gap) if (sheet_w + gap) > 0 else 0
+if mod_fit != 0:
+    st.warning(
+        f"⚠️ A largura da parede ({int(wall_w)} mm) não fecha com módulos de {int(sheet_w)}+{int(gap)} mm. "
+        f"Considere ajustar para múltiplos de {int(sheet_w + gap)} mm."
+    )
+
+st.caption("© Atlas Frames — v1.2.1. Usa grade de múltiplos (padrão 300 mm); retalhos ≤ grade acima da porta são fundidos com a peça superior.")
